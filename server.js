@@ -323,18 +323,56 @@ app.post('/chat', async (req, res) => {
   }
 });
 
-// ── TTS (text-to-speech via OpenAI) ────────────────────────────
-const TTS_VOICE = process.env.TTS_VOICE || 'fable'; // British-leaning
-const TTS_MODEL = 'tts-1';
+// ── TTS (text-to-speech: ElevenLabs primary, OpenAI fallback) ──
+const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
+const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_turbo_v2_5';
+const OPENAI_TTS_VOICE = process.env.TTS_VOICE || 'nova';
+const OPENAI_TTS_MODEL = 'tts-1';
+
 const ttsCache = new Map();
 const TTS_CACHE_MAX = 50;
 
-// GET /tts?text=...  — streams MP3 bytes as they arrive from OpenAI for low latency
+async function fetchElevenLabsStream(text) {
+  if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) throw new Error('ElevenLabs not configured');
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream?optimize_streaming_latency=2`;
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'xi-api-key': ELEVEN_API_KEY,
+      'Content-Type': 'application/json',
+      'Accept': 'audio/mpeg'
+    },
+    body: JSON.stringify({
+      text: text.slice(0, 4000),
+      model_id: ELEVEN_MODEL,
+      voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+    })
+  });
+  if (!r.ok) {
+    const errText = await r.text().catch(() => '');
+    throw new Error(`ElevenLabs ${r.status}: ${errText.slice(0, 200)}`);
+  }
+  return r.body;
+}
+
+async function fetchOpenAIStream(text) {
+  const r = await client.audio.speech.create({
+    model: OPENAI_TTS_MODEL,
+    voice: OPENAI_TTS_VOICE,
+    input: text.slice(0, 4000),
+    response_format: 'mp3'
+  });
+  return r.body;
+}
+
+// GET /tts?text=...  — streams MP3 bytes as they arrive from the provider
 app.get('/tts', async (req, res) => {
   const text = (req.query.text || '').toString();
   if (!text.trim()) return res.status(400).end('text required');
 
-  const cacheKey = `${TTS_VOICE}:${text}`;
+  const cacheKeyVoice = ELEVEN_VOICE_ID || OPENAI_TTS_VOICE;
+  const cacheKey = `${cacheKeyVoice}:${text}`;
   if (ttsCache.has(cacheKey)) {
     const cached = ttsCache.get(cacheKey);
     ttsCache.delete(cacheKey);
@@ -344,20 +382,29 @@ app.get('/tts', async (req, res) => {
     return res.send(cached);
   }
 
+  let stream;
+  let provider = 'unknown';
+  try {
+    stream = await fetchElevenLabsStream(text);
+    provider = 'elevenlabs';
+  } catch (err) {
+    console.warn('ElevenLabs TTS unavailable, falling back to OpenAI:', err.message);
+    try {
+      stream = await fetchOpenAIStream(text);
+      provider = 'openai';
+    } catch (err2) {
+      console.error('Both TTS providers failed:', err2.message);
+      return res.status(500).json({ error: err2.message });
+    }
+  }
+
   res.set('Content-Type', 'audio/mpeg');
   res.set('Cache-Control', 'public, max-age=3600');
   res.set('Transfer-Encoding', 'chunked');
 
   const chunks = [];
   try {
-    const response = await client.audio.speech.create({
-      model: TTS_MODEL,
-      voice: TTS_VOICE,
-      input: text.slice(0, 4000),
-      response_format: 'mp3'
-    });
-
-    const reader = response.body.getReader();
+    const reader = stream.getReader();
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -373,7 +420,7 @@ app.get('/tts', async (req, res) => {
     }
     ttsCache.set(cacheKey, full);
   } catch (err) {
-    console.error('TTS error:', err.message);
+    console.error(`TTS streaming error (${provider}):`, err.message);
     if (!res.headersSent) {
       res.status(500).json({ error: err.message });
     } else {

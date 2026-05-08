@@ -524,7 +524,8 @@
     let isListening = false;
     let recognition = null;
     let orderItems = []; // { name, price }
-    let currentAudio = null; // active OpenAI TTS Audio instance
+    let currentAudio = null; // active TTS Audio instance currently playing
+    let audioQueue = [];     // all queued chunks for the current speak() call
 
     const chatEl = document.getElementById('chat');
     const micBtn = document.getElementById('mic-btn');
@@ -586,10 +587,29 @@
     window.speechSynthesis.onvoiceschanged = loadVoices;
 
     function stopCurrentAudio() {
-      if (currentAudio) {
-        try { currentAudio.pause(); } catch (e) {}
-        currentAudio = null;
+      audioQueue.forEach(a => {
+        try { a.pause(); a.src = ''; } catch (e) {}
+      });
+      audioQueue = [];
+      currentAudio = null;
+    }
+
+    // Split text into chunks of ~maxLen chars on sentence boundaries
+    // so the first chunk plays fast while later chunks are still loading.
+    function splitIntoChunks(text, maxLen = 180) {
+      const sentences = text.match(/[^.!?]+[.!?]+|\S[^.!?]*$/g);
+      if (!sentences || sentences.length <= 1) return [text];
+      const chunks = [];
+      let current = '';
+      for (const s of sentences) {
+        const sentence = s.trim();
+        if (!sentence) continue;
+        if (!current) current = sentence;
+        else if ((current + ' ' + sentence).length <= maxLen) current += ' ' + sentence;
+        else { chunks.push(current); current = sentence; }
       }
+      if (current) chunks.push(current);
+      return chunks.length ? chunks : [text];
     }
 
     function fallbackBrowserTTS(text) {
@@ -604,8 +624,8 @@
       window.speechSynthesis.speak(utt);
     }
 
-    // speak(text, onReady) — onReady fires once the audio is buffered and about to play
-    // (or when fallback TTS kicks in). Use it to render the bubble in sync with the voice.
+    // speak(text, onReady) — splits long text into chunks, fetches them in parallel,
+    // plays them sequentially. onReady fires when the first chunk is ready to play.
     function speak(text, onReady) {
       stopCurrentAudio();
       window.speechSynthesis.cancel();
@@ -621,34 +641,55 @@
         if (onReady) onReady();
       };
 
-      const url = '/tts?text=' + encodeURIComponent(text);
-      const audio = new Audio();
-      audio.preload = 'auto';
-      audio.src = url;
-      currentAudio = audio;
+      const chunks = splitIntoChunks(text);
 
-      // Fire onReady the moment we have enough data to start playback
-      audio.addEventListener('loadeddata', fireReady, { once: true });
-      audio.addEventListener('playing', fireReady, { once: true });
-
-      audio.addEventListener('ended', () => {
-        if (currentAudio === audio) currentAudio = null;
+      // Create audio elements for every chunk — browser starts fetching them in parallel
+      const audios = chunks.map(chunk => {
+        const audio = new Audio();
+        audio.preload = 'auto';
+        audio.src = '/tts?text=' + encodeURIComponent(chunk);
+        return audio;
       });
-      audio.addEventListener('error', () => {
-        if (currentAudio === audio) currentAudio = null;
-        console.warn('TTS audio error, falling back to browser TTS');
+
+      audioQueue = audios.slice();
+      currentAudio = audios[0];
+
+      // First chunk: fire onReady when it's buffered or starts playing
+      audios[0].addEventListener('loadeddata', fireReady, { once: true });
+      audios[0].addEventListener('playing', fireReady, { once: true });
+
+      // Chain playback: when chunk N ends, play chunk N+1
+      audios.forEach((audio, i) => {
+        const next = audios[i + 1] || null;
+        audio.addEventListener('ended', () => {
+          audioQueue = audioQueue.filter(a => a !== audio);
+          if (next) {
+            currentAudio = next;
+            next.play().catch(err => console.warn('Next chunk play failed:', err));
+          } else if (currentAudio === audio) {
+            currentAudio = null;
+          }
+        }, { once: true });
+
+        audio.addEventListener('error', () => {
+          console.warn('TTS audio error on chunk', i);
+          if (i === 0 && !readyFired) {
+            stopCurrentAudio();
+            fireReady();
+            fallbackBrowserTTS(text);
+          }
+        });
+      });
+
+      // Start playing first chunk
+      audios[0].play().catch((err) => {
+        stopCurrentAudio();
         fireReady();
+        console.warn('First chunk play failed, falling back to browser TTS:', err.message);
         fallbackBrowserTTS(text);
       });
 
-      audio.play().catch((err) => {
-        if (currentAudio === audio) currentAudio = null;
-        console.warn('Audio play failed, falling back to browser TTS:', err.message);
-        fireReady();
-        fallbackBrowserTTS(text);
-      });
-
-      // Safety: if the audio takes too long, fire onReady anyway so the UI doesn't hang
+      // Safety: if first chunk takes too long, fire onReady anyway
       setTimeout(fireReady, 1500);
     }
 

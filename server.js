@@ -323,6 +323,65 @@ app.post('/chat', async (req, res) => {
   }
 });
 
+// ── TTS (text-to-speech via OpenAI) ────────────────────────────
+const TTS_VOICE = process.env.TTS_VOICE || 'fable'; // British-leaning
+const TTS_MODEL = 'tts-1';
+const ttsCache = new Map();
+const TTS_CACHE_MAX = 50;
+
+// GET /tts?text=...  — streams MP3 bytes as they arrive from OpenAI for low latency
+app.get('/tts', async (req, res) => {
+  const text = (req.query.text || '').toString();
+  if (!text.trim()) return res.status(400).end('text required');
+
+  const cacheKey = `${TTS_VOICE}:${text}`;
+  if (ttsCache.has(cacheKey)) {
+    const cached = ttsCache.get(cacheKey);
+    ttsCache.delete(cacheKey);
+    ttsCache.set(cacheKey, cached);
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Cache-Control', 'public, max-age=3600');
+    return res.send(cached);
+  }
+
+  res.set('Content-Type', 'audio/mpeg');
+  res.set('Cache-Control', 'public, max-age=3600');
+  res.set('Transfer-Encoding', 'chunked');
+
+  const chunks = [];
+  try {
+    const response = await client.audio.speech.create({
+      model: TTS_MODEL,
+      voice: TTS_VOICE,
+      input: text.slice(0, 4000),
+      response_format: 'mp3'
+    });
+
+    const reader = response.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const buf = Buffer.from(value);
+      chunks.push(buf);
+      res.write(buf);
+    }
+    res.end();
+
+    const full = Buffer.concat(chunks);
+    if (ttsCache.size >= TTS_CACHE_MAX) {
+      ttsCache.delete(ttsCache.keys().next().value);
+    }
+    ttsCache.set(cacheKey, full);
+  } catch (err) {
+    console.error('TTS error:', err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    } else {
+      res.end();
+    }
+  }
+});
+
 app.listen(process.env.PORT || 3000, () => {
   console.log('🍔 Lamego\'s AI running at http://localhost:3000');
   fetchWeather();

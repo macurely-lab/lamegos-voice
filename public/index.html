@@ -524,6 +524,7 @@
     let isListening = false;
     let recognition = null;
     let orderItems = []; // { name, price }
+    let currentAudio = null; // active OpenAI TTS Audio instance
 
     const chatEl = document.getElementById('chat');
     const micBtn = document.getElementById('mic-btn');
@@ -561,6 +562,7 @@
     function startListening() {
       if (!recognition || isListening) return;
       window.speechSynthesis.cancel();
+      stopCurrentAudio();
       try {
         recognition.start();
         isListening = true;
@@ -583,7 +585,14 @@
     loadVoices();
     window.speechSynthesis.onvoiceschanged = loadVoices;
 
-    function speak(text) {
+    function stopCurrentAudio() {
+      if (currentAudio) {
+        try { currentAudio.pause(); } catch (e) {}
+        currentAudio = null;
+      }
+    }
+
+    function fallbackBrowserTTS(text) {
       window.speechSynthesis.cancel();
       const utt = new SpeechSynthesisUtterance(text);
       utt.lang = 'en-GB';
@@ -593,6 +602,54 @@
       const gb = voices.find(v => v.lang === 'en-GB');
       if (gb) utt.voice = gb;
       window.speechSynthesis.speak(utt);
+    }
+
+    // speak(text, onReady) — onReady fires once the audio is buffered and about to play
+    // (or when fallback TTS kicks in). Use it to render the bubble in sync with the voice.
+    function speak(text, onReady) {
+      stopCurrentAudio();
+      window.speechSynthesis.cancel();
+      if (!text || !text.trim()) {
+        if (onReady) onReady();
+        return;
+      }
+
+      let readyFired = false;
+      const fireReady = () => {
+        if (readyFired) return;
+        readyFired = true;
+        if (onReady) onReady();
+      };
+
+      const url = '/tts?text=' + encodeURIComponent(text);
+      const audio = new Audio();
+      audio.preload = 'auto';
+      audio.src = url;
+      currentAudio = audio;
+
+      // Fire onReady the moment we have enough data to start playback
+      audio.addEventListener('loadeddata', fireReady, { once: true });
+      audio.addEventListener('playing', fireReady, { once: true });
+
+      audio.addEventListener('ended', () => {
+        if (currentAudio === audio) currentAudio = null;
+      });
+      audio.addEventListener('error', () => {
+        if (currentAudio === audio) currentAudio = null;
+        console.warn('TTS audio error, falling back to browser TTS');
+        fireReady();
+        fallbackBrowserTTS(text);
+      });
+
+      audio.play().catch((err) => {
+        if (currentAudio === audio) currentAudio = null;
+        console.warn('Audio play failed, falling back to browser TTS:', err.message);
+        fireReady();
+        fallbackBrowserTTS(text);
+      });
+
+      // Safety: if the audio takes too long, fire onReady anyway so the UI doesn't hang
+      setTimeout(fireReady, 1500);
     }
 
     // ── CHAT RENDERING ───────────────────────────────────
@@ -698,9 +755,9 @@
           body: JSON.stringify({ messages, sessionId })
         });
         const data = await res.json();
-        hideTyping();
 
         if (data.error) {
+          hideTyping();
           renderBubble('assistant', `[error] ${data.error}`);
           return;
         }
@@ -713,9 +770,12 @@
           branch: data.branch || null,
           orderType: data.orderType || null
         })});
-        renderBubble('assistant', reply);
-        speak(reply);
         applyServerData(data);
+        // Keep the typing dots visible while TTS loads, then reveal bubble + voice together.
+        speak(reply, () => {
+          hideTyping();
+          renderBubble('assistant', reply);
+        });
       } catch (e) {
         hideTyping();
         renderBubble('assistant', `[network error] ${e.message}`);
@@ -762,7 +822,6 @@
           body: JSON.stringify({ messages, sessionId })
         });
         const data = await res.json();
-        hideTyping();
         if (data.text) {
           const reply = data.text;
           messages.push({ role: 'assistant', content: JSON.stringify({
@@ -771,9 +830,13 @@
             branch: data.branch || null,
             orderType: data.orderType || null
           })});
-          renderBubble('assistant', reply);
-          speak(reply);
           applyServerData(data);
+          speak(reply, () => {
+            hideTyping();
+            renderBubble('assistant', reply);
+          });
+        } else {
+          hideTyping();
         }
       } catch (e) {
         hideTyping();
@@ -796,6 +859,7 @@
     resetBtn.addEventListener('click', () => {
       if (confirm('End this call and start a new one?')) {
         window.speechSynthesis.cancel();
+        stopCurrentAudio();
         if (recognition && isListening) recognition.stop();
         initCall();
       }

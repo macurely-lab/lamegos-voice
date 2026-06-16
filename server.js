@@ -333,6 +333,24 @@ const OPENAI_TTS_MODEL = 'tts-1';
 const ttsCache = new Map();
 const TTS_CACHE_MAX = 50;
 
+// ElevenLabs mispronounces "£" and the inch mark — rewrite to spoken words for
+// the VOICE only. The on-screen text (chat bubble + order panel) is unaffected,
+// since this runs inside the /tts route, not on the displayed reply.
+// £12.50 -> "12 pounds 50", £13 -> "13 pounds", £0.99 -> "99 pence", 10" -> "10 inch"
+function normalizeForSpeech(text) {
+  return text
+    .replace(/£\s?(\d+)(?:\.(\d{1,2}))?/g, (_, poundsStr, penceStr) => {
+      const pounds = parseInt(poundsStr, 10);
+      // ".5" means 50p, ".05" means 5p — pad single digit on the right
+      const pence = penceStr ? parseInt(penceStr.length === 1 ? penceStr + '0' : penceStr, 10) : 0;
+      const poundWord = pounds === 1 ? 'pound' : 'pounds';
+      if (pounds === 0 && pence > 0) return `${pence} pence`;
+      if (pence === 0) return `${pounds} ${poundWord}`;
+      return `${pounds} ${poundWord} ${pence}`;
+    })
+    .replace(/(\d+)\s*"/g, '$1 inch'); // 10" -> 10 inch (pizza sizes)
+}
+
 async function fetchElevenLabsStream(text) {
   if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) throw new Error('ElevenLabs not configured');
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream?optimize_streaming_latency=2`;
@@ -368,8 +386,9 @@ async function fetchOpenAIStream(text) {
 
 // GET /tts?text=...  — streams MP3 bytes as they arrive from the provider
 app.get('/tts', async (req, res) => {
-  const text = (req.query.text || '').toString();
-  if (!text.trim()) return res.status(400).end('text required');
+  const rawText = (req.query.text || '').toString();
+  if (!rawText.trim()) return res.status(400).end('text required');
+  const text = normalizeForSpeech(rawText);
 
   const cacheKeyVoice = ELEVEN_VOICE_ID || OPENAI_TTS_VOICE;
   const cacheKey = `${cacheKeyVoice}:${text}`;

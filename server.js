@@ -1,8 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
-const OpenAI = require('openai');
-const { toFile } = require('openai');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
@@ -15,21 +13,11 @@ app.use(express.static(path.join(__dirname, 'public')));
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const LLM_MODEL = process.env.LLM_MODEL || 'claude-haiku-4-5';
 
-// AssemblyAI is used ONLY for speech-to-text (transcription). The ordering brain
-// stays on Claude. If ASSEMBLYAI_API_KEY is unset, /stt returns an error and the
-// front-end falls back to the browser's built-in speech recognition.
-// (OpenAI client kept below — no longer used for STT, left in place intentionally.)
-const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// AssemblyAI is used ONLY for speech-to-text, via realtime streaming. The browser
+// opens a WebSocket directly to AssemblyAI using a short-lived token minted by
+// /stt/token below, so the API key never reaches the client. The ordering brain
+// stays on Claude.
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY;
-const ASSEMBLYAI_BASE = 'https://api.assemblyai.com/v2';
-// Vocabulary boost so AssemblyAI spells Lamego's menu terms correctly.
-const STT_WORD_BOOST = [
-  'Peri Peri', 'Peri Chicken', 'Naga', 'Beef Donner', 'Doner', 'House Bread',
-  'Smashed Burger', 'Butcher Burger', 'Fried Chicken', 'Loaded Fries', 'Rice Box',
-  'Irn Bru', 'Pepsi Max', 'Rubicon Mango', 'Tango Orange', 'Biscoff', 'Lotus',
-  'Ferrero Rocher', 'Kinder Bueno', 'Maltesers', 'mozzarella sticks', 'jalapeno poppers',
-  'onion rings', 'milkshake', 'mini cheesecake', 'Wishaw', 'Blantyre', 'delivery', 'collection'
-];
 
 // ── SESSION MEMORY ─────────────────────────────────────────────
 const sessions = {};
@@ -415,88 +403,6 @@ async function fetchElevenLabsStream(text) {
   }
   return r.body;
 }
-
-// Transcribe raw audio bytes with AssemblyAI (upload → request → poll).
-async function transcribeWithAssemblyAI(audioBuffer) {
-  const t0 = Date.now();
-  console.log(`[STT] received audio: ${audioBuffer.length} bytes`);
-
-  // 1. Upload the raw audio bytes; AssemblyAI returns a temporary upload URL.
-  console.log('[STT] uploading to AssemblyAI...');
-  const uploadRes = await fetch(`${ASSEMBLYAI_BASE}/upload`, {
-    method: 'POST',
-    headers: { authorization: ASSEMBLYAI_API_KEY, 'content-type': 'application/octet-stream' },
-    body: audioBuffer
-  });
-  if (!uploadRes.ok) {
-    const errText = await uploadRes.text().catch(() => '');
-    console.error(`[STT] upload failed ${uploadRes.status}: ${errText.slice(0, 300)}`);
-    throw new Error(`AssemblyAI upload ${uploadRes.status}`);
-  }
-  const { upload_url } = await uploadRes.json();
-  console.log(`[STT] uploaded OK in ${Date.now() - t0}ms`);
-
-  // 2. Kick off the transcription job (English + menu-vocabulary boost).
-  const createRes = await fetch(`${ASSEMBLYAI_BASE}/transcript`, {
-    method: 'POST',
-    headers: { authorization: ASSEMBLYAI_API_KEY, 'content-type': 'application/json' },
-    body: JSON.stringify({
-      audio_url: upload_url,
-      language_code: 'en',
-      punctuate: true,
-      format_text: true,
-      word_boost: STT_WORD_BOOST,
-      boost_param: 'high'
-    })
-  });
-  if (!createRes.ok) {
-    const errText = await createRes.text().catch(() => '');
-    console.error(`[STT] create failed ${createRes.status}: ${errText.slice(0, 300)}`);
-    throw new Error(`AssemblyAI transcript ${createRes.status}`);
-  }
-  let job = await createRes.json();
-  console.log(`[STT] job created id=${job.id} status=${job.status}`);
-
-  // 3. Poll until the job completes (or a safety timeout).
-  const deadline = Date.now() + 60000;
-  let polls = 0;
-  while (job.status !== 'completed' && job.status !== 'error') {
-    if (Date.now() > deadline) throw new Error('AssemblyAI transcription timed out');
-    await new Promise(r => setTimeout(r, 250));
-    const pollRes = await fetch(`${ASSEMBLYAI_BASE}/transcript/${job.id}`, {
-      headers: { authorization: ASSEMBLYAI_API_KEY }
-    });
-    if (!pollRes.ok) {
-      const errText = await pollRes.text().catch(() => '');
-      console.error(`[STT] poll failed ${pollRes.status}: ${errText.slice(0, 300)}`);
-      throw new Error(`AssemblyAI poll ${pollRes.status}`);
-    }
-    job = await pollRes.json();
-    polls++;
-    if (polls % 4 === 0) console.log(`[STT] poll #${polls} status=${job.status} (${Date.now() - t0}ms)`);
-  }
-  if (job.status === 'error') throw new Error(job.error || 'AssemblyAI transcription failed');
-  console.log(`[STT] DONE in ${Date.now() - t0}ms: "${(job.text || '').trim()}"`);
-  return (job.text || '').trim();
-}
-
-// POST /stt  — body is raw audio bytes; returns { text } transcribed by AssemblyAI.
-// express.raw is scoped to this route only, so it doesn't affect express.json elsewhere.
-app.post('/stt', express.raw({ type: '*/*', limit: '25mb' }), async (req, res) => {
-  if (!ASSEMBLYAI_API_KEY) {
-    return res.status(503).json({ error: 'STT not configured (ASSEMBLYAI_API_KEY missing)' });
-  }
-  if (!req.body || !req.body.length) {
-    return res.status(400).json({ error: 'no audio' });
-  }
-  try {
-    const text = await transcribeWithAssemblyAI(req.body);
-    res.json({ text });
-  } catch (err) {
-    console.error('STT error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // GET /stt/token — mints a short-lived AssemblyAI streaming token for the
 // browser to open a realtime WebSocket directly. Keeps the API key server-side.

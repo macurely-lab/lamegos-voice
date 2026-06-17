@@ -596,29 +596,26 @@
       micHint.textContent = 'Tap to record';
     }
 
-    // ── SERVER-SIDE STT (OpenAI gpt-4o-transcribe) ───────
-    // Preferred path: record the mic and transcribe on the server for far
-    // better accuracy than the browser. Falls back to browser recognition
-    // (above) if recording isn't available or the /stt call fails.
-    const canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
-    let mediaRecorder = null;
+    // ── REALTIME STT (AssemblyAI Universal Streaming v3) ─────────
+    // Streams mic audio (PCM16 @ 16kHz) over a WebSocket straight to AssemblyAI
+    // and receives transcripts live — far faster than record-then-upload.
+    // Our server only mints a short-lived token (/stt/token) so the API key
+    // never reaches the browser. Falls back to browser SpeechRecognition if
+    // streaming can't start.
+    const TARGET_SR = 16000;
+    const canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia &&
+                         (window.AudioContext || window.webkitAudioContext) && window.WebSocket);
     let mediaStream = null;
-    let recordedChunks = [];
-    let recordingCanceled = false;
-    let isTranscribing = false;
-
-    // Voice-activity detection: auto-stop after the caller pauses, like a real call.
-    const SILENCE_MS = 1000;        // stop this long after speech ends
-    const MAX_RECORD_MS = 20000;    // hard safety cap on a single utterance
-    const SPEECH_THRESHOLD = 0.012; // RMS above this counts as speech
     let audioCtx = null;
-    let analyser = null;
-    let vadRAF = null;
-    let silenceTimer = null;
-    let maxTimer = null;
-    let hasSpoken = false;
+    let sourceNode = null;
+    let processorNode = null;
+    let aaiSocket = null;
+    let isTranscribing = false;   // kept for the mic-button guard; unused with streaming
+    let finishing = false;
+    let latestTranscript = '';
+    let pendingFrames = [];        // PCM captured before the socket is open
+    let socketOpen = false;
 
-    // If the browser can record, the mic works even without SpeechRecognition.
     if (canRecord) {
       micBtn.disabled = false;
       micBtn.title = '';
@@ -629,116 +626,170 @@
       if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
     }
 
-    function setupVAD(stream) {
-      try {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        if (audioCtx.resume) audioCtx.resume();
-        const source = audioCtx.createMediaStreamSource(stream);
-        analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 512;
-        source.connect(analyser);
-        hasSpoken = false;
-        const data = new Uint8Array(analyser.fftSize);
-        const tick = () => {
-          if (!analyser) return;
-          analyser.getByteTimeDomainData(data);
-          let sum = 0;
-          for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
-          const rms = Math.sqrt(sum / data.length);
-          if (rms > SPEECH_THRESHOLD) {
-            hasSpoken = true;
-            if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
-          } else if (hasSpoken && !silenceTimer) {
-            silenceTimer = setTimeout(stopRecording, SILENCE_MS);
-          }
-          vadRAF = requestAnimationFrame(tick);
-        };
-        vadRAF = requestAnimationFrame(tick);
-      } catch (e) {
-        console.warn('VAD unavailable — tap the mic again to stop:', e);
+    function floatTo16BitPCM(input) {
+      const out = new Int16Array(input.length);
+      for (let i = 0; i < input.length; i++) {
+        const s = Math.max(-1, Math.min(1, input[i]));
+        out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
       }
+      return out;
     }
 
-    function teardownVAD() {
-      if (vadRAF) { cancelAnimationFrame(vadRAF); vadRAF = null; }
-      if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
-      if (maxTimer) { clearTimeout(maxTimer); maxTimer = null; }
-      analyser = null;
-      if (audioCtx) { try { audioCtx.close(); } catch (e) {} audioCtx = null; }
-      hasSpoken = false;
+    // Average-downsample the mic's native rate (usually 44.1/48k) to 16kHz.
+    function downsampleTo16k(buffer, inRate) {
+      if (inRate === TARGET_SR) return buffer;
+      const ratio = inRate / TARGET_SR;
+      const newLen = Math.round(buffer.length / ratio);
+      const result = new Float32Array(newLen);
+      let oRes = 0, oBuf = 0;
+      while (oRes < newLen) {
+        const next = Math.round((oRes + 1) * ratio);
+        let acc = 0, cnt = 0;
+        for (let i = oBuf; i < next && i < buffer.length; i++) { acc += buffer[i]; cnt++; }
+        result[oRes++] = cnt ? acc / cnt : 0;
+        oBuf = next;
+      }
+      return result;
+    }
+
+    function teardownAudio() {
+      try { if (processorNode) { processorNode.disconnect(); processorNode.onaudioprocess = null; } } catch (e) {}
+      try { if (sourceNode) sourceNode.disconnect(); } catch (e) {}
+      try { if (audioCtx) audioCtx.close(); } catch (e) {}
+      processorNode = null; sourceNode = null; audioCtx = null;
+      socketOpen = false;
+      pendingFrames = [];
+      releaseMic();
     }
 
     async function startRecording() {
       if (isListening) return;
       window.speechSynthesis.cancel();
       stopCurrentAudio();
-      try {
-        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      } catch (e) {
-        console.error('Mic access failed:', e);
-        if (recognition) startListening();          // fall back to browser STT
-        else micHint.textContent = 'Mic blocked — type instead';
-        return;
-      }
-      recordedChunks = [];
-      recordingCanceled = false;
-      let opts;
-      if (window.MediaRecorder && MediaRecorder.isTypeSupported) {
-        if (MediaRecorder.isTypeSupported('audio/webm')) opts = { mimeType: 'audio/webm' };
-        else if (MediaRecorder.isTypeSupported('audio/mp4')) opts = { mimeType: 'audio/mp4' };
-      }
-      mediaRecorder = opts ? new MediaRecorder(mediaStream, opts) : new MediaRecorder(mediaStream);
-      mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) recordedChunks.push(e.data); };
-      mediaRecorder.onstop = handleRecordingStop;
-      mediaRecorder.start();
+
+      // INSTANT feedback — flip to "listening" immediately, before any await.
+      finishing = false;
+      latestTranscript = '';
+      pendingFrames = [];
+      socketOpen = false;
       isListening = true;
       micBtn.classList.add('listening');
       micHint.textContent = 'Listening — just pause when done';
-      setupVAD(mediaStream);
-      maxTimer = setTimeout(stopRecording, MAX_RECORD_MS);
+
+      // Kick off the token fetch in parallel with mic acquisition (overlap latency).
+      const tokenPromise = fetch('/stt/token')
+        .then(r => { if (!r.ok) throw new Error('token ' + r.status); return r.json(); })
+        .then(d => d.token);
+
+      // 1. Mic
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+        });
+      } catch (e) {
+        console.error('Mic access failed:', e);
+        isListening = false;
+        micBtn.classList.remove('listening');
+        if (recognition) startListening();           // fall back to browser STT
+        else micHint.textContent = 'Mic blocked — type instead';
+        return;
+      }
+      if (!isListening) { releaseMic(); return; }     // user tapped stop during mic acquire
+
+      // 2. Start capturing audio NOW — buffer frames until the socket is open.
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.resume) audioCtx.resume();
+      sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+      processorNode = audioCtx.createScriptProcessor(4096, 1, 1);
+      const silent = audioCtx.createGain();
+      silent.gain.value = 0;                          // keep the graph alive without echoing the mic
+      sourceNode.connect(processorNode);
+      processorNode.connect(silent);
+      silent.connect(audioCtx.destination);
+      processorNode.onaudioprocess = (ev) => {
+        const input = ev.inputBuffer.getChannelData(0);
+        const pcm16 = floatTo16BitPCM(downsampleTo16k(input, audioCtx.sampleRate));
+        if (socketOpen && aaiSocket && aaiSocket.readyState === WebSocket.OPEN) {
+          aaiSocket.send(pcm16.buffer);
+        } else {
+          pendingFrames.push(pcm16.buffer);           // buffer pre-connection speech
+        }
+      };
+
+      // 3. Wait for the token, then open the AssemblyAI realtime socket.
+      let token;
+      try {
+        token = await tokenPromise;
+      } catch (e) {
+        console.error('STT token failed:', e);
+        cancelRecording();
+        if (recognition) startListening();
+        else micHint.textContent = 'STT unavailable — type instead';
+        return;
+      }
+      if (!isListening) return;                       // user tapped stop during token fetch
+
+      const url = `wss://streaming.assemblyai.com/v3/ws?sample_rate=${TARGET_SR}&format_turns=true&token=${encodeURIComponent(token)}`;
+      aaiSocket = new WebSocket(url);
+      aaiSocket.binaryType = 'arraybuffer';
+
+      aaiSocket.onopen = () => {
+        // Flush everything captured before the connection was ready, then go live.
+        socketOpen = true;
+        for (const buf of pendingFrames) {
+          try { aaiSocket.send(buf); } catch (e) {}
+        }
+        pendingFrames = [];
+      };
+
+      aaiSocket.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch (e) { return; }
+        if (msg.type === 'Turn') {
+          if (msg.transcript) {
+            latestTranscript = msg.transcript;        // tracked for finalize; not shown on screen
+          }
+          // AssemblyAI detects a natural pause; the formatted turn is the final text.
+          if (msg.end_of_turn && msg.turn_is_formatted) {
+            finishStreaming(msg.transcript);
+          }
+        }
+      };
+
+      aaiSocket.onerror = (e) => { console.error('AssemblyAI WS error:', e); };
+      aaiSocket.onclose = () => { teardownAudio(); };
     }
 
+    // Finalize the utterance: stop audio, close the socket, send the transcript.
+    function finishStreaming(textOverride) {
+      if (finishing) return;
+      finishing = true;
+      isListening = false;
+      micBtn.classList.remove('listening');
+      if (aaiSocket && aaiSocket.readyState === WebSocket.OPEN) {
+        try { aaiSocket.send(JSON.stringify({ type: 'Terminate' })); } catch (e) {}
+      }
+      teardownAudio();
+      if (aaiSocket) { try { aaiSocket.close(); } catch (e) {} aaiSocket = null; }
+      const text = ((textOverride != null ? textOverride : latestTranscript) || '').trim();
+      micHint.textContent = 'Tap to speak';
+      if (text) sendMessage(text);
+    }
+
+    // Manual stop (tap mic again): finalize with whatever we have so far.
     function stopRecording() {
-      teardownVAD();
-      if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+      finishStreaming();
     }
 
     function cancelRecording() {
-      recordingCanceled = true;
-      teardownVAD();
-      if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-      else releaseMic();
+      if (finishing) return;
+      finishing = true;
       isListening = false;
       micBtn.classList.remove('listening');
-    }
-
-    async function handleRecordingStop() {
-      teardownVAD();
-      releaseMic();
-      isListening = false;
-      micBtn.classList.remove('listening');
-      const chunks = recordedChunks;
-      recordedChunks = [];
-      if (recordingCanceled) { recordingCanceled = false; micHint.textContent = 'Tap to speak'; return; }
-      const type = (mediaRecorder && mediaRecorder.mimeType) || 'audio/webm';
-      const blob = new Blob(chunks, { type });
-      if (!blob.size) { micHint.textContent = 'Tap to speak'; return; }
-      isTranscribing = true;
-      micBtn.classList.add('processing');
-      micHint.textContent = '';
-      try {
-        const res = await fetch('/stt', { method: 'POST', headers: { 'Content-Type': blob.type }, body: blob });
-        if (!res.ok) throw new Error('stt ' + res.status);
-        const data = await res.json();
-        const transcript = (data.text || '').trim();
-        if (transcript) sendMessage(transcript);
-      } catch (e) {
-        console.error('Server STT failed:', e);
-      } finally {
-        isTranscribing = false;
-        micBtn.classList.remove('processing');
-        micHint.textContent = 'Tap to speak';
-      }
+      teardownAudio();
+      if (aaiSocket) { try { aaiSocket.close(); } catch (e) {} aaiSocket = null; }
+      latestTranscript = '';
+      micHint.textContent = 'Tap to speak';
     }
 
     // ── SPEECH SYNTHESIS ─────────────────────────────────

@@ -461,9 +461,59 @@
       .order { border-top: 1px solid var(--line); }
       body { overflow: auto; }
     }
+
+    /* ── START OVERLAY (tap-to-begin so greeting audio plays on mobile) ── */
+    .start-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      display: grid;
+      place-items: center;
+      background: radial-gradient(ellipse at top, #1a1d26 0%, var(--bg-0) 70%);
+    }
+    .start-card {
+      text-align: center;
+      padding: 40px 32px;
+      animation: fadeIn 0.4s ease-out;
+    }
+    .start-logo {
+      width: 84px;
+      height: 84px;
+      margin: 0 auto 20px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent) 0%, var(--gold) 100%);
+      display: grid;
+      place-items: center;
+      font-size: 40px;
+    }
+    .start-card h2 { font-size: 22px; font-weight: 600; margin-bottom: 8px; }
+    .start-card p { color: var(--muted); font-size: 14px; margin-bottom: 28px; }
+    .start-btn {
+      font-size: 16px;
+      font-weight: 600;
+      color: #fff;
+      padding: 16px 36px;
+      border: none;
+      border-radius: 999px;
+      cursor: pointer;
+      background: linear-gradient(135deg, var(--accent) 0%, #c2303d 100%);
+      box-shadow: 0 8px 28px rgba(230, 57, 70, 0.35);
+      transition: transform 0.15s ease, box-shadow 0.25s ease;
+    }
+    .start-btn:hover { transform: scale(1.03); }
+    .start-btn:active { transform: scale(0.97); }
   </style>
 </head>
 <body>
+  <div id="start-overlay" class="start-overlay">
+    <div class="start-card">
+      <div class="start-logo">🍔</div>
+      <h2>Lamego's Takeaway</h2>
+      <p>Tap below to start your order</p>
+      <button id="start-btn" class="start-btn">📞 Start Call</button>
+    </div>
+  </div>
+
   <div class="app">
     <!-- LEFT: CALL -->
     <section class="call">
@@ -544,6 +594,18 @@
     let orderItems = []; // { name, price }
     let currentAudio = null; // active TTS Audio instance currently playing
     let audioQueue = [];     // all queued chunks for the current speak() call
+
+    // ── MOBILE AUDIO UNLOCK ──────────────────────────────
+    // Mobile browsers only allow audio that begins inside a real user tap.
+    // We reuse ONE <audio> element and "unlock" it on the first tap, so every
+    // later speak() can play without a fresh gesture (fixes silent TTS on phones).
+    const SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+    let audioUnlocked = false;
+    let ttsHandlers = null;
+    const ttsAudio = new Audio();
+    ttsAudio.preload = 'auto';
+    ttsAudio.playsInline = true;
+    ttsAudio.setAttribute('playsinline', '');
 
     const chatEl = document.getElementById('chat');
     const micBtn = document.getElementById('mic-btn');
@@ -749,12 +811,37 @@
     loadVoices();
     window.speechSynthesis.onvoiceschanged = loadVoices;
 
+    function detachTtsHandlers() {
+      if (!ttsHandlers) return;
+      ttsAudio.removeEventListener('loadeddata', ttsHandlers.ready);
+      ttsAudio.removeEventListener('playing', ttsHandlers.ready);
+      ttsAudio.removeEventListener('ended', ttsHandlers.ended);
+      ttsAudio.removeEventListener('error', ttsHandlers.error);
+      ttsHandlers = null;
+    }
+
     function stopCurrentAudio() {
-      audioQueue.forEach(a => {
-        try { a.pause(); a.src = ''; } catch (e) {}
-      });
+      detachTtsHandlers();
+      try { ttsAudio.pause(); } catch (e) {}
       audioQueue = [];
       currentAudio = null;
+    }
+
+    // Called from the first user tap to satisfy the mobile autoplay rule:
+    // a one-time silent play()/pause() "blesses" the element for later use.
+    function unlockAudio() {
+      if (audioUnlocked) return;
+      try {
+        ttsAudio.muted = true;
+        ttsAudio.src = SILENT_WAV;
+        const p = ttsAudio.play();
+        if (p && p.then) {
+          p.then(() => { ttsAudio.pause(); ttsAudio.currentTime = 0; ttsAudio.muted = false; audioUnlocked = true; })
+           .catch(() => { ttsAudio.muted = false; });
+        } else {
+          ttsAudio.pause(); ttsAudio.muted = false; audioUnlocked = true;
+        }
+      } catch (e) { ttsAudio.muted = false; }
     }
 
     function fallbackBrowserTTS(text) {
@@ -795,27 +882,28 @@
         fallbackBrowserTTS(text);
       };
 
-      const audio = new Audio();
-      audio.preload = 'auto';
+      // Reuse the single unlocked element so mobile lets it play.
+      const audio = ttsAudio;
+      audio.muted = false;
       audio.src = '/tts?text=' + encodeURIComponent(text);
 
       audioQueue = [audio];
       currentAudio = audio;
 
-      // Reveal the reply when audio is buffered or starts playing.
-      audio.addEventListener('loadeddata', fireReady, { once: true });
-      audio.addEventListener('playing', fireReady, { once: true });
-
-      audio.addEventListener('ended', () => {
-        audioQueue = audioQueue.filter(a => a !== audio);
-        if (currentAudio === audio) currentAudio = null;
-      }, { once: true });
-
-      // Only fall back if playback never got going (don't cut off mid-clip).
-      audio.addEventListener('error', () => {
+      const onReadyEvt = () => fireReady();
+      const onEnded = () => { if (currentAudio === audio) currentAudio = null; };
+      const onError = () => {
         console.warn('TTS audio error, falling back to browser TTS');
         if (!readyFired) doFallback();
-      });
+      };
+      ttsHandlers = { ready: onReadyEvt, ended: onEnded, error: onError };
+
+      // Reveal the reply when audio is buffered or starts playing.
+      audio.addEventListener('loadeddata', onReadyEvt, { once: true });
+      audio.addEventListener('playing', onReadyEvt, { once: true });
+      audio.addEventListener('ended', onEnded, { once: true });
+      // Only fall back if playback never got going (don't cut off mid-clip).
+      audio.addEventListener('error', onError);
 
       audio.play().catch((err) => {
         console.warn('Audio play failed, falling back to browser TTS:', err.message);
@@ -1020,6 +1108,7 @@
 
     // ── EVENT BINDINGS ───────────────────────────────────
     micBtn.addEventListener('click', () => {
+      unlockAudio();                       // satisfy mobile autoplay on the first real tap
       if (isTranscribing) return;          // ignore taps while a clip is being transcribed
       if (canRecord) {
         if (isListening) stopRecording();
@@ -1030,10 +1119,10 @@
       }
     });
 
-    sendBtn.addEventListener('click', () => sendMessage(textInput.value));
+    sendBtn.addEventListener('click', () => { unlockAudio(); sendMessage(textInput.value); });
 
     textInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') sendMessage(textInput.value);
+      if (e.key === 'Enter') { unlockAudio(); sendMessage(textInput.value); }
     });
 
     resetBtn.addEventListener('click', () => {
@@ -1046,8 +1135,16 @@
       }
     });
 
-    // Boot
-    initCall();
+    // Boot — wait for the user's first tap so the greeting audio is permitted
+    // to play on mobile. The tap unlocks the audio element, then we start the
+    // call; the greeting now plays reliably on every device.
+    const startOverlay = document.getElementById('start-overlay');
+    const startBtn = document.getElementById('start-btn');
+    startBtn.addEventListener('click', () => {
+      unlockAudio();                       // unlock inside the gesture
+      startOverlay.style.display = 'none';
+      initCall();                          // greeting plays on the now-unlocked element
+    });
   </script>
 </body>
 </html>

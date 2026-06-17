@@ -254,6 +254,24 @@
       100% { transform: scale(1.35); opacity: 0; }
     }
 
+    .mic-btn.processing {
+      background: rgba(212, 160, 80, 0.14);
+      border-color: rgba(212, 160, 80, 0.4);
+    }
+
+    .mic-btn.processing::before {
+      content: '';
+      position: absolute;
+      inset: -6px;
+      border-radius: 50%;
+      border: 2px solid rgba(212, 160, 80, 0.5);
+      border-top-color: transparent;
+      animation: spin 0.8s linear infinite;
+      pointer-events: none;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
     .mic-icon { display: grid; place-items: center; }
     .mic-icon-active { display: none; }
     .mic-btn.listening .mic-icon-idle { display: none; }
@@ -578,6 +596,151 @@
       micHint.textContent = 'Tap to record';
     }
 
+    // ── SERVER-SIDE STT (OpenAI gpt-4o-transcribe) ───────
+    // Preferred path: record the mic and transcribe on the server for far
+    // better accuracy than the browser. Falls back to browser recognition
+    // (above) if recording isn't available or the /stt call fails.
+    const canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+    let mediaRecorder = null;
+    let mediaStream = null;
+    let recordedChunks = [];
+    let recordingCanceled = false;
+    let isTranscribing = false;
+
+    // Voice-activity detection: auto-stop after the caller pauses, like a real call.
+    const SILENCE_MS = 1000;        // stop this long after speech ends
+    const MAX_RECORD_MS = 20000;    // hard safety cap on a single utterance
+    const SPEECH_THRESHOLD = 0.012; // RMS above this counts as speech
+    let audioCtx = null;
+    let analyser = null;
+    let vadRAF = null;
+    let silenceTimer = null;
+    let maxTimer = null;
+    let hasSpoken = false;
+
+    // If the browser can record, the mic works even without SpeechRecognition.
+    if (canRecord) {
+      micBtn.disabled = false;
+      micBtn.title = '';
+      micHint.textContent = 'Tap to speak';
+    }
+
+    function releaseMic() {
+      if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+    }
+
+    function setupVAD(stream) {
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.resume) audioCtx.resume();
+        const source = audioCtx.createMediaStreamSource(stream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 512;
+        source.connect(analyser);
+        hasSpoken = false;
+        const data = new Uint8Array(analyser.fftSize);
+        const tick = () => {
+          if (!analyser) return;
+          analyser.getByteTimeDomainData(data);
+          let sum = 0;
+          for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
+          const rms = Math.sqrt(sum / data.length);
+          if (rms > SPEECH_THRESHOLD) {
+            hasSpoken = true;
+            if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+          } else if (hasSpoken && !silenceTimer) {
+            silenceTimer = setTimeout(stopRecording, SILENCE_MS);
+          }
+          vadRAF = requestAnimationFrame(tick);
+        };
+        vadRAF = requestAnimationFrame(tick);
+      } catch (e) {
+        console.warn('VAD unavailable — tap the mic again to stop:', e);
+      }
+    }
+
+    function teardownVAD() {
+      if (vadRAF) { cancelAnimationFrame(vadRAF); vadRAF = null; }
+      if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+      if (maxTimer) { clearTimeout(maxTimer); maxTimer = null; }
+      analyser = null;
+      if (audioCtx) { try { audioCtx.close(); } catch (e) {} audioCtx = null; }
+      hasSpoken = false;
+    }
+
+    async function startRecording() {
+      if (isListening) return;
+      window.speechSynthesis.cancel();
+      stopCurrentAudio();
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (e) {
+        console.error('Mic access failed:', e);
+        if (recognition) startListening();          // fall back to browser STT
+        else micHint.textContent = 'Mic blocked — type instead';
+        return;
+      }
+      recordedChunks = [];
+      recordingCanceled = false;
+      let opts;
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported) {
+        if (MediaRecorder.isTypeSupported('audio/webm')) opts = { mimeType: 'audio/webm' };
+        else if (MediaRecorder.isTypeSupported('audio/mp4')) opts = { mimeType: 'audio/mp4' };
+      }
+      mediaRecorder = opts ? new MediaRecorder(mediaStream, opts) : new MediaRecorder(mediaStream);
+      mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) recordedChunks.push(e.data); };
+      mediaRecorder.onstop = handleRecordingStop;
+      mediaRecorder.start();
+      isListening = true;
+      micBtn.classList.add('listening');
+      micHint.textContent = 'Listening — just pause when done';
+      setupVAD(mediaStream);
+      maxTimer = setTimeout(stopRecording, MAX_RECORD_MS);
+    }
+
+    function stopRecording() {
+      teardownVAD();
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+    }
+
+    function cancelRecording() {
+      recordingCanceled = true;
+      teardownVAD();
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+      else releaseMic();
+      isListening = false;
+      micBtn.classList.remove('listening');
+    }
+
+    async function handleRecordingStop() {
+      teardownVAD();
+      releaseMic();
+      isListening = false;
+      micBtn.classList.remove('listening');
+      const chunks = recordedChunks;
+      recordedChunks = [];
+      if (recordingCanceled) { recordingCanceled = false; micHint.textContent = 'Tap to speak'; return; }
+      const type = (mediaRecorder && mediaRecorder.mimeType) || 'audio/webm';
+      const blob = new Blob(chunks, { type });
+      if (!blob.size) { micHint.textContent = 'Tap to speak'; return; }
+      isTranscribing = true;
+      micBtn.classList.add('processing');
+      micHint.textContent = '';
+      try {
+        const res = await fetch('/stt', { method: 'POST', headers: { 'Content-Type': blob.type }, body: blob });
+        if (!res.ok) throw new Error('stt ' + res.status);
+        const data = await res.json();
+        const transcript = (data.text || '').trim();
+        if (transcript) sendMessage(transcript);
+      } catch (e) {
+        console.error('Server STT failed:', e);
+      } finally {
+        isTranscribing = false;
+        micBtn.classList.remove('processing');
+        micHint.textContent = 'Tap to speak';
+      }
+    }
+
     // ── SPEECH SYNTHESIS ─────────────────────────────────
     let voicesReady = false;
     function loadVoices() {
@@ -887,8 +1050,14 @@
 
     // ── EVENT BINDINGS ───────────────────────────────────
     micBtn.addEventListener('click', () => {
-      if (isListening) recognition.stop();
-      else startListening();
+      if (isTranscribing) return;          // ignore taps while a clip is being transcribed
+      if (canRecord) {
+        if (isListening) stopRecording();
+        else startRecording();
+      } else if (recognition) {
+        if (isListening) recognition.stop();
+        else startListening();
+      }
     });
 
     sendBtn.addEventListener('click', () => sendMessage(textInput.value));
@@ -901,7 +1070,8 @@
       if (confirm('End this call and start a new one?')) {
         window.speechSynthesis.cancel();
         stopCurrentAudio();
-        if (recognition && isListening) recognition.stop();
+        if (canRecord && isListening) cancelRecording();
+        else if (recognition && isListening) recognition.stop();
         initCall();
       }
     });

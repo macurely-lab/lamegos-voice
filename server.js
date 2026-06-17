@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
+const OpenAI = require('openai');
+const { toFile } = require('openai');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
@@ -12,6 +14,19 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const LLM_MODEL = process.env.LLM_MODEL || 'claude-haiku-4-5';
+
+// OpenAI is used ONLY for speech-to-text (transcription). The ordering brain
+// stays on Claude. If OPENAI_API_KEY is unset, /stt returns an error and the
+// front-end falls back to the browser's built-in speech recognition.
+const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const STT_MODEL = process.env.STT_MODEL || 'gpt-4o-transcribe';
+// Vocabulary hint so the model spells Lamego's menu terms correctly.
+const STT_PROMPT =
+  "Lamego's takeaway phone order, Scottish accent. Likely words: Peri Peri, " +
+  "Peri Chicken, Naga, Beef Donner, Doner, House Bread, Smashed Burger, Butcher Burger, " +
+  "Fried Chicken, Loaded Fries, Rice Box, Irn Bru, Pepsi Max, Rubicon Mango, Tango Orange, " +
+  "Biscoff, Lotus, Ferrero Rocher, Kinder Bueno, Maltesers, mozzarella sticks, jalapeno poppers, " +
+  "onion rings, milkshake, mini cheesecake, Wishaw, Blantyre, delivery, collection.";
 
 // ── SESSION MEMORY ─────────────────────────────────────────────
 const sessions = {};
@@ -396,6 +411,32 @@ async function fetchElevenLabsStream(text) {
   }
   return r.body;
 }
+
+// POST /stt  — body is raw audio bytes; returns { text } transcribed by OpenAI.
+// express.raw is scoped to this route only, so it doesn't affect express.json elsewhere.
+app.post('/stt', express.raw({ type: '*/*', limit: '25mb' }), async (req, res) => {
+  if (!process.env.OPENAI_API_KEY) {
+    return res.status(503).json({ error: 'STT not configured (OPENAI_API_KEY missing)' });
+  }
+  if (!req.body || !req.body.length) {
+    return res.status(400).json({ error: 'no audio' });
+  }
+  try {
+    const contentType = req.get('content-type') || 'audio/webm';
+    const filename = contentType.includes('mp4') ? 'audio.mp4' : 'audio.webm';
+    const file = await toFile(req.body, filename, { type: contentType });
+    const result = await openaiClient.audio.transcriptions.create({
+      file,
+      model: STT_MODEL,
+      prompt: STT_PROMPT,
+      language: 'en'
+    });
+    res.json({ text: (result.text || '').trim() });
+  } catch (err) {
+    console.error('STT error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // GET /tts?text=...  — streams MP3 bytes as they arrive from ElevenLabs
 app.get('/tts', async (req, res) => {

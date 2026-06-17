@@ -757,24 +757,6 @@
       currentAudio = null;
     }
 
-    // Split text into chunks of ~maxLen chars on sentence boundaries
-    // so the first chunk plays fast while later chunks are still loading.
-    function splitIntoChunks(text, maxLen = 180) {
-      const sentences = text.match(/[^.!?]+[.!?]+|\S[^.!?]*$/g);
-      if (!sentences || sentences.length <= 1) return [text];
-      const chunks = [];
-      let current = '';
-      for (const s of sentences) {
-        const sentence = s.trim();
-        if (!sentence) continue;
-        if (!current) current = sentence;
-        else if ((current + ' ' + sentence).length <= maxLen) current += ' ' + sentence;
-        else { chunks.push(current); current = sentence; }
-      }
-      if (current) chunks.push(current);
-      return chunks.length ? chunks : [text];
-    }
-
     function fallbackBrowserTTS(text) {
       window.speechSynthesis.cancel();
       const utt = new SpeechSynthesisUtterance(text);
@@ -787,8 +769,9 @@
       window.speechSynthesis.speak(utt);
     }
 
-    // speak(text, onReady) — splits long text into chunks, fetches them in parallel,
-    // plays them sequentially. onReady fires when the first chunk is ready to play.
+    // speak(text, onReady) — sends the whole reply to ElevenLabs as ONE request and
+    // plays it as a single clip. This is gapless (no chunk-boundary hitches or clipped
+    // words). onReady fires when the audio is buffered/playing, or after a safety timeout.
     function speak(text, onReady) {
       stopCurrentAudio();
       window.speechSynthesis.cancel();
@@ -798,61 +781,48 @@
       }
 
       let readyFired = false;
+      let fellBack = false;
       const fireReady = () => {
         if (readyFired) return;
         readyFired = true;
         if (onReady) onReady();
       };
-
-      const chunks = splitIntoChunks(text);
-
-      // Create audio elements for every chunk — browser starts fetching them in parallel
-      const audios = chunks.map(chunk => {
-        const audio = new Audio();
-        audio.preload = 'auto';
-        audio.src = '/tts?text=' + encodeURIComponent(chunk);
-        return audio;
-      });
-
-      audioQueue = audios.slice();
-      currentAudio = audios[0];
-
-      // First chunk: fire onReady when it's buffered or starts playing
-      audios[0].addEventListener('loadeddata', fireReady, { once: true });
-      audios[0].addEventListener('playing', fireReady, { once: true });
-
-      // Chain playback: when chunk N ends, play chunk N+1
-      audios.forEach((audio, i) => {
-        const next = audios[i + 1] || null;
-        audio.addEventListener('ended', () => {
-          audioQueue = audioQueue.filter(a => a !== audio);
-          if (next) {
-            currentAudio = next;
-            next.play().catch(err => console.warn('Next chunk play failed:', err));
-          } else if (currentAudio === audio) {
-            currentAudio = null;
-          }
-        }, { once: true });
-
-        audio.addEventListener('error', () => {
-          console.warn('TTS audio error on chunk', i);
-          if (i === 0 && !readyFired) {
-            stopCurrentAudio();
-            fireReady();
-            fallbackBrowserTTS(text);
-          }
-        });
-      });
-
-      // Start playing first chunk
-      audios[0].play().catch((err) => {
+      const doFallback = () => {
+        if (fellBack) return;
+        fellBack = true;
         stopCurrentAudio();
         fireReady();
-        console.warn('First chunk play failed, falling back to browser TTS:', err.message);
         fallbackBrowserTTS(text);
+      };
+
+      const audio = new Audio();
+      audio.preload = 'auto';
+      audio.src = '/tts?text=' + encodeURIComponent(text);
+
+      audioQueue = [audio];
+      currentAudio = audio;
+
+      // Reveal the reply when audio is buffered or starts playing.
+      audio.addEventListener('loadeddata', fireReady, { once: true });
+      audio.addEventListener('playing', fireReady, { once: true });
+
+      audio.addEventListener('ended', () => {
+        audioQueue = audioQueue.filter(a => a !== audio);
+        if (currentAudio === audio) currentAudio = null;
+      }, { once: true });
+
+      // Only fall back if playback never got going (don't cut off mid-clip).
+      audio.addEventListener('error', () => {
+        console.warn('TTS audio error, falling back to browser TTS');
+        if (!readyFired) doFallback();
       });
 
-      // Safety: if first chunk takes too long, fire onReady anyway
+      audio.play().catch((err) => {
+        console.warn('Audio play failed, falling back to browser TTS:', err.message);
+        doFallback();
+      });
+
+      // Safety: reveal the reply even if the audio is slow to load.
       setTimeout(fireReady, 1500);
     }
 

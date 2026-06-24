@@ -407,10 +407,33 @@
       animation: fadeIn 0.3s ease-out;
     }
 
+    .order-item-main {
+      flex: 1;
+      min-width: 0;
+    }
+
     .order-item-name {
       font-size: 13px;
-      flex: 1;
       line-height: 1.4;
+    }
+
+    .order-item-custom {
+      font-size: 11px;
+      line-height: 1.5;
+      margin-top: 3px;
+      color: var(--muted);
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .order-item-custom .cust-minus { color: #c97a7a; }
+    .order-item-custom .cust-plus { color: #7fb88a; }
+    .order-item-custom .cust-dot { color: var(--line); }
+    .order-item-custom .cust-charge {
+      color: var(--gold);
+      font-weight: 600;
     }
 
     .order-item-price {
@@ -591,7 +614,7 @@
     let sessionId = null;
     let isListening = false;
     let recognition = null;
-    let orderItems = []; // { name, price }
+    let orderItems = []; // { name, price, removals, additions, extraCharge }
     let currentAudio = null; // active TTS Audio instance currently playing
     let audioQueue = [];     // all queued chunks for the current speak() call
 
@@ -999,7 +1022,13 @@
       if (Array.isArray(data.order)) {
         orderItems = data.order
           .filter(it => it && typeof it.name === 'string' && typeof it.price === 'number')
-          .map(it => ({ name: it.name, price: it.price }));
+          .map(it => ({
+            name: it.name,
+            price: it.price,
+            removals: Array.isArray(it.removals) ? it.removals : [],
+            additions: Array.isArray(it.additions) ? it.additions : [],
+            extraCharge: typeof it.extraCharge === 'number' ? it.extraCharge : 0
+          }));
         renderOrder();
       }
 
@@ -1024,6 +1053,15 @@
       if (data.customerName) nameEl.textContent = data.customerName;
     }
 
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
     function renderOrder() {
       if (orderItems.length === 0) {
         orderBody.innerHTML = '<div class="order-empty">No items yet — start ordering!</div>';
@@ -1034,7 +1072,31 @@
       for (const it of orderItems) {
         const row = document.createElement('div');
         row.className = 'order-item';
-        row.innerHTML = `<span class="order-item-name">${it.name}</span><span class="order-item-price">£${it.price.toFixed(2)}</span>`;
+
+        const removals = Array.isArray(it.removals) ? it.removals : [];
+        const additions = Array.isArray(it.additions) ? it.additions : [];
+        const extraCharge = typeof it.extraCharge === 'number' ? it.extraCharge : 0;
+
+        // Build the customisation sub-line: "− onion · + extra beef"
+        const custom = [
+          ...removals.map(r => `<span class="cust-minus">− ${escapeHtml(r)}</span>`),
+          ...additions.map(a => `<span class="cust-plus">+ ${escapeHtml(a)}</span>`)
+        ].join('<span class="cust-dot">·</span>');
+
+        const chargeTag = extraCharge > 0
+          ? ` <span class="cust-charge">+£${extraCharge.toFixed(2)}</span>`
+          : '';
+
+        const customLine = custom
+          ? `<div class="order-item-custom">${custom}${chargeTag}</div>`
+          : '';
+
+        row.innerHTML =
+          `<div class="order-item-main">` +
+            `<span class="order-item-name">${escapeHtml(it.name)}</span>` +
+            customLine +
+          `</div>` +
+          `<span class="order-item-price">£${it.price.toFixed(2)}</span>`;
         orderBody.appendChild(row);
       }
       const totalEl = document.createElement('div');
@@ -1076,9 +1138,11 @@
         }
 
         const reply = data.text || '';
-        // Send raw assistant turn back into history so the AI can see its own JSON state
+        // History keeps the placeholder version (rawReply) so the AI keeps writing
+        // {{PRICE}}/{{TOTAL}} rather than literal figures; display/voice use the
+        // resolved text.
         messages.push({ role: 'assistant', content: JSON.stringify({
-          reply,
+          reply: data.rawReply || reply,
           order: data.order || [],
           branch: data.branch || null,
           orderType: data.orderType || null
@@ -1138,7 +1202,7 @@
         if (data.text) {
           const reply = data.text;
           messages.push({ role: 'assistant', content: JSON.stringify({
-            reply,
+            reply: data.rawReply || reply,
             order: data.order || [],
             branch: data.branch || null,
             orderType: data.orderType || null

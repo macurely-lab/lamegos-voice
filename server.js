@@ -217,7 +217,7 @@ You take orders by phone — warm, friendly, efficient, with a touch of Scottish
 
 <order_flow>
 - First question: "Wishaw or Blantyre, and is it delivery or collection?"
-- Delivery postcodes: Wishaw = ML1/ML2, Blantyre = G72. If a postcode is outside these, politely flag it.
+- For delivery, collect the FULL address — postcode, then street, then house number — following <address_capture> below. Delivery areas: Wishaw = ML1/ML2, Blantyre = G72. If a postcode is outside the chosen branch's area, politely flag it and do not continue with the address.
 - Build the order one item at a time, confirming each addition with its price using the {{PRICE}} placeholder (never a typed figure).
 - Burgers/wraps: ask single or double if not specified.
 - Pizzas: ask the size (10", 12", or 16") if not specified.
@@ -234,14 +234,23 @@ Once the customer picks delivery OR collection, NEVER switch it for the rest of 
 - "collection" → the final readback MUST say "for collection", ETA 15-20 minutes.
 </delivery_collection_lock>
 
-<address_confirmation>
-This applies ONLY to delivery orders — skip it entirely for collection.
-- The moment the customer gives a delivery address or postcode, READ IT BACK to confirm before moving on: "Let me just confirm — that's delivery to [full address/postcode], is that right?"
-- Wait for the customer to confirm it. If they correct it, read the corrected address back again and confirm once more.
-- Do NOT give the final order readback or close the order until the delivery address has been confirmed out loud.
-- In the final readback, restate the confirmed address: "...for delivery to [address], that'll be 35-45 minutes."
-- Never assume an address is right just because it was said once — always confirm it back.
-</address_confirmation>
+<address_capture>
+This applies ONLY to delivery orders — skip it entirely for collection. Collect the delivery address in THREE steps, IN THIS ORDER, ONE step per turn, confirming each part before moving on. Ask only for the next missing part — never ask for all three at once.
+
+STEP 1 — Postcode. Ask for the postcode first: "What's the postcode for delivery?"
+- Check the area: Wishaw delivers to ML1 and ML2, Blantyre delivers to G72. If the postcode is NOT in the chosen branch's area, politely say it's outside the delivery area and do NOT continue with the rest of the address.
+- If it IS in the area, read it back clearly and confirm before moving on: "Lovely, that's ML2 7AB — is that right?" Only proceed once they confirm. Record it in "postcode".
+
+STEP 2 — Street. Once the postcode is confirmed, ask for the street: "And what street is that?"
+- Read the street back to confirm: "Kirk Road, got it." If they correct it, read the corrected street back. Record it in "street".
+
+STEP 3 — House number. Then ask for the house or flat number: "And the house number?"
+- Read it back as a FULL-address confirmation: "So that's 47 Kirk Road, ML2 7AB — is that right?" If they correct any part, confirm again. Record it in "houseNumber".
+
+- Do NOT give the final order readback or close the order until ALL THREE parts (postcode, street, house number) are captured AND the full address has been confirmed out loud.
+- In the final readback, restate the full confirmed address: "...for delivery to 47 Kirk Road, ML2 7AB, that'll be 35-45 minutes."
+- Never assume a part is right just because it was said once — always read it back.
+</address_capture>
 
 <upselling>
 Upselling is a CORE part of your job — Lamego's wants every order to grow, so be proactive and confident. Stay natural and friendly (never robotic or pushy), but work a relevant suggestion into nearly every turn. Only ONE suggestion per reply so it stays smooth.
@@ -367,7 +376,7 @@ function salvageParsed(input) {
   let reply = typeof parsed.reply === 'string' ? parsed.reply : '';
 
   // Markers that mean structured data leaked into the reply text.
-  const leak = reply.match(/<\/?(?:invoke|parameter|function)|","?\s*(?:order|branch|orderType|address|customerName)"?\s*[:>]/i);
+  const leak = reply.match(/<\/?(?:invoke|parameter|function)|","?\s*(?:order|branch|orderType|address|postcode|street|houseNumber|customerName)"?\s*[:>]/i);
   if (leak) {
     const tail = reply.slice(leak.index);
 
@@ -378,7 +387,7 @@ function salvageParsed(input) {
       if (arr) { try { const rec = JSON.parse(arr); if (Array.isArray(rec)) parsed.order = rec; } catch (e) {} }
     }
     // Recover simple scalar fields if they were lost.
-    for (const key of ['branch', 'orderType', 'address', 'customerName']) {
+    for (const key of ['branch', 'orderType', 'address', 'postcode', 'street', 'houseNumber', 'customerName']) {
       if (parsed[key] == null) {
         const m = tail.match(new RegExp('"' + key + '"\\s*[:>]\\s*"([^"]*)"', 'i'));
         if (m) parsed[key] = m[1];
@@ -468,6 +477,19 @@ function injectPrices(reply, order, prevOrder = []) {
     .replace(/\{\{\s*PRICE\s*\}\}/gi, '£' + itemPrice.toFixed(2));
 }
 
+// ── ADDRESS ASSEMBLY ───────────────────────────────────────────
+// The model emits the delivery address as three separate parts (houseNumber,
+// street, postcode). The server combines them into one display/readback string
+// — "47 Kirk Road, ML2 7AB" — so the order panel and history are consistent
+// regardless of how the model phrased things. Tolerates partial capture (only
+// the postcode given so far → "ML2 7AB") and returns null when nothing is set.
+function buildAddress({ houseNumber, street, postcode } = {}) {
+  const clean = v => (typeof v === 'string' && v.trim()) ? v.trim() : '';
+  const line1 = [clean(houseNumber), clean(street)].filter(Boolean).join(' ');
+  const parts = [line1, clean(postcode)].filter(Boolean);
+  return parts.length ? parts.join(', ') : null;
+}
+
 // ── STRUCTURED OUTPUT TOOL ─────────────────────────────────────
 // Sonnet does not support assistant-message prefill, so instead of forcing a
 // leading "{" we force a tool call. tool_choice locks the model into calling
@@ -499,7 +521,9 @@ const RESPONSE_TOOL = {
       },
       branch: { type: 'string', enum: ['Wishaw', 'Blantyre'], description: 'Selected branch. Set as soon as chosen and keep it the same for the whole call. Omit until the customer has chosen.' },
       orderType: { type: 'string', enum: ['delivery', 'collection'], description: 'Set as soon as chosen and keep it the same for the whole call. Omit until the customer has chosen.' },
-      address: { type: 'string', description: 'Delivery postcode/address (delivery only). Set as soon as the customer gives it. Omit for collection or before it is given.' },
+      postcode: { type: 'string', description: 'Delivery postcode, e.g. "ML2 7AB" (delivery only). Set once the customer confirms it. Must be in the chosen branch area (Wishaw ML1/ML2, Blantyre G72). Omit for collection or before it is given.' },
+      street: { type: 'string', description: 'Delivery street name, e.g. "Kirk Road" (delivery only). Set once the customer confirms it. Omit for collection or before it is given.' },
+      houseNumber: { type: 'string', description: 'Delivery house or flat number, e.g. "47" or "Flat 2, 47" (delivery only). Set once the customer confirms it. Omit for collection or before it is given.' },
       customerName: { type: 'string', description: 'The customer name once given. Omit otherwise.' }
     },
     required: ['reply', 'order']
@@ -558,7 +582,13 @@ app.post('/chat', async (req, res) => {
     const text = injectPrices(rawReply, order, prevOrder);
     const branch = parsed.branch || null;
     const orderType = parsed.orderType || null;
-    const address = parsed.address || null;
+    const postcode = parsed.postcode || null;
+    const street = parsed.street || null;
+    const houseNumber = parsed.houseNumber || null;
+    // Combine the structured parts into the single address string the panel
+    // shows. Fall back to a legacy `address` field if an old session/leak only
+    // carried the combined form.
+    const address = buildAddress({ houseNumber, street, postcode }) || parsed.address || null;
     const customerName = parsed.customerName || null;
 
     // Stored verbatim into session history (with placeholders) for audit/persistence.
@@ -568,7 +598,7 @@ app.post('/chat', async (req, res) => {
       saveSessions();
     }
 
-    res.json({ text, rawReply, order, branch, orderType, address, customerName, sessionId });
+    res.json({ text, rawReply, order, branch, orderType, address, houseNumber, street, postcode, customerName, sessionId });
   } catch (err) {
     console.error(err.message);
     res.status(500).json({ error: err.message });
@@ -715,4 +745,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { salvageParsed, extractBalancedArray, normalizeOrder, normalizeOrderItem, injectPrices, currentItemPrice, reconcileOrder, lastUserText, REMOVAL_INTENT };
+module.exports = { salvageParsed, extractBalancedArray, normalizeOrder, normalizeOrderItem, injectPrices, currentItemPrice, reconcileOrder, lastUserText, buildAddress, REMOVAL_INTENT };

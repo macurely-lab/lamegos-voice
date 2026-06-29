@@ -540,12 +540,65 @@ app.post('/session/new', (req, res) => {
   res.json({ sessionId: id });
 });
 
-// Chat
+// ── CORE: one ordering turn ────────────────────────────────────
+// Runs the Lamego's brain for a SINGLE turn given the conversation so far (an
+// array of {role, content} where assistant turns are our raw placeholder JSON).
+// Shared by the web /chat route AND the Vapi /chat/completions route so the
+// phone and web assistants can never drift apart. Returns the spoken `text`
+// (exact prices already injected), the placeholder `rawReply`, the reconciled
+// `order`, the call fields, and `raw` (the JSON to store back into history).
+async function generateReply(messages) {
+  await fetchWeather();
+
+  const response = await client.messages.create({
+    model: LLM_MODEL,
+    max_tokens: 600,
+    // System prompt is a top-level param in the Messages API (not a message).
+    system: getSystemPrompt(),
+    tools: [RESPONSE_TOOL],
+    // Force the model to answer by calling submit_response — guarantees a
+    // structured, schema-valid object instead of free-form text.
+    tool_choice: { type: 'tool', name: 'submit_response' },
+    messages: messages.map(m => ({ role: m.role, content: m.content }))
+  });
+
+  // With forced tool_choice the response always contains a tool_use block
+  // whose .input is the already-parsed object. Fall back defensively.
+  const toolUse = response.content.find(b => b.type === 'tool_use');
+  // salvageParsed repairs the rare malformed tool call where the model leaks
+  // raw markup/JSON into the reply string and loses the structured order.
+  const parsed = salvageParsed((toolUse && toolUse.input) || { reply: '', order: [] });
+
+  const prevOrder = normalizeOrder(extractPrevOrder(messages));
+  // Guard the cart against the model erroneously dropping earlier items.
+  const order = reconcileOrder(normalizeOrder(parsed.order), prevOrder, lastUserText(messages));
+  // rawReply keeps the {{PRICE}}/{{TOTAL}} placeholders; text has them filled
+  // with exact figures. We speak `text` but store `rawReply` back into history
+  // so the model keeps writing placeholders, never literals.
+  const rawReply = parsed.reply || '';
+  const text = injectPrices(rawReply, order, prevOrder);
+  const postcode = parsed.postcode || null;
+  const street = parsed.street || null;
+  const houseNumber = parsed.houseNumber || null;
+  // Combine the structured parts into the single address string the panel shows.
+  const address = buildAddress({ houseNumber, street, postcode }) || parsed.address || null;
+
+  // Stored verbatim into history (with placeholders) for the next turn.
+  const raw = JSON.stringify({ ...parsed, reply: rawReply });
+
+  return {
+    text, rawReply, order, raw,
+    branch: parsed.branch || null,
+    orderType: parsed.orderType || null,
+    address, houseNumber, street, postcode,
+    customerName: parsed.customerName || null
+  };
+}
+
+// Chat (web UI). The browser sends the full message history each turn.
 app.post('/chat', async (req, res) => {
   const { messages, sessionId } = req.body;
   if (!messages || !Array.isArray(messages)) return res.status(400).json({ error: 'messages required' });
-
-  await fetchWeather();
 
   if (sessionId && sessions[sessionId]) {
     sessions[sessionId].messages = messages;
@@ -553,56 +606,121 @@ app.post('/chat', async (req, res) => {
   }
 
   try {
-    const response = await client.messages.create({
-      model: LLM_MODEL,
-      max_tokens: 600,
-      // System prompt is a top-level param in the Messages API (not a message).
-      system: getSystemPrompt(),
-      tools: [RESPONSE_TOOL],
-      // Force the model to answer by calling submit_response — guarantees a
-      // structured, schema-valid object instead of free-form text.
-      tool_choice: { type: 'tool', name: 'submit_response' },
-      messages: messages.map(m => ({ role: m.role, content: m.content }))
-    });
-
-    // With forced tool_choice the response always contains a tool_use block
-    // whose .input is the already-parsed object. Fall back defensively.
-    const toolUse = response.content.find(b => b.type === 'tool_use');
-    // salvageParsed repairs the rare malformed tool call where the model leaks
-    // raw markup/JSON into the reply string and loses the structured order.
-    const parsed = salvageParsed((toolUse && toolUse.input) || { reply: '', order: [] });
-
-    const prevOrder = normalizeOrder(extractPrevOrder(messages));
-    // Guard the cart against the model erroneously dropping earlier items.
-    const order = reconcileOrder(normalizeOrder(parsed.order), prevOrder, lastUserText(messages));
-    // rawReply keeps the {{PRICE}}/{{TOTAL}} placeholders; text has them filled
-    // with exact figures. The browser displays/speaks `text` but feeds `rawReply`
-    // back into history so the model keeps writing placeholders, never literals.
-    const rawReply = parsed.reply || '';
-    const text = injectPrices(rawReply, order, prevOrder);
-    const branch = parsed.branch || null;
-    const orderType = parsed.orderType || null;
-    const postcode = parsed.postcode || null;
-    const street = parsed.street || null;
-    const houseNumber = parsed.houseNumber || null;
-    // Combine the structured parts into the single address string the panel
-    // shows. Fall back to a legacy `address` field if an old session/leak only
-    // carried the combined form.
-    const address = buildAddress({ houseNumber, street, postcode }) || parsed.address || null;
-    const customerName = parsed.customerName || null;
-
+    const r = await generateReply(messages);
     // Stored verbatim into session history (with placeholders) for audit/persistence.
-    const raw = JSON.stringify({ ...parsed, reply: rawReply });
     if (sessionId && sessions[sessionId]) {
-      sessions[sessionId].messages.push({ role: 'assistant', content: raw });
+      sessions[sessionId].messages.push({ role: 'assistant', content: r.raw });
       saveSessions();
     }
-
-    res.json({ text, rawReply, order, branch, orderType, address, houseNumber, street, postcode, customerName, sessionId });
+    res.json({
+      text: r.text, rawReply: r.rawReply, order: r.order,
+      branch: r.branch, orderType: r.orderType, address: r.address,
+      houseNumber: r.houseNumber, street: r.street, postcode: r.postcode,
+      customerName: r.customerName, sessionId
+    });
   } catch (err) {
     console.error(err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── VAPI CUSTOM LLM (OpenAI-compatible) ────────────────────────
+// Vapi's "Custom LLM" provider POSTs an OpenAI-style /chat/completions request
+// on every turn of a phone call. We IGNORE Vapi's own system prompt and run our
+// own Lamego's brain (menu + server-side pricing + cart safety), then return the
+// spoken reply in OpenAI streaming (SSE) format for Vapi's TTS to speak.
+// Conversation + order state is kept server-side keyed by Vapi's call id, so the
+// {{PRICE}}/{{TOTAL}} placeholders and cart reconciliation work exactly as in the
+// web app (the model keeps seeing its own placeholder JSON history, never literals).
+const VAPI_LLM_KEY = process.env.VAPI_CUSTOM_LLM_KEY; // optional shared secret
+const callSessions = {}; // in-memory per-call history, keyed by Vapi call id
+
+function vapiAuthOk(req) {
+  if (!VAPI_LLM_KEY) return true; // open until a key is configured
+  return (req.get('authorization') || '') === `Bearer ${VAPI_LLM_KEY}`;
+}
+
+function getCallId(req) {
+  const b = req.body || {};
+  return (b.call && b.call.id) || (b.metadata && b.metadata.callId) || req.get('x-call-id') || null;
+}
+
+// OpenAI message content may be a string or an array of parts — flatten to text.
+function contentToText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map(p => (typeof p === 'string' ? p : (p && p.text) || '')).join(' ').trim();
+  }
+  return '';
+}
+
+function lastUserUtterance(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i] && messages[i].role === 'user') return contentToText(messages[i].content);
+  }
+  return '';
+}
+
+function sseChunk(res, obj) {
+  res.write(`data: ${JSON.stringify(obj)}\n\n`);
+}
+
+app.post('/chat/completions', async (req, res) => {
+  if (!vapiAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+
+  const body = req.body || {};
+  const vapiMessages = Array.isArray(body.messages) ? body.messages : [];
+  const callId = getCallId(req);
+  const userText = lastUserUtterance(vapiMessages);
+
+  // Build the conversation history we feed to our brain. With a stable call id
+  // we keep our OWN history (assistant turns stored as placeholder JSON, which
+  // preserves pricing integrity). Without one (rare), we degrade gracefully to
+  // Vapi's spoken history.
+  let history;
+  if (callId) {
+    const sess = callSessions[callId] || (callSessions[callId] = { messages: [], createdAt: Date.now() });
+    if (userText) sess.messages.push({ role: 'user', content: userText });
+    history = sess.messages;
+  } else {
+    history = vapiMessages
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .map(m => ({ role: m.role, content: contentToText(m.content) }));
+  }
+
+  let reply;
+  try {
+    const r = await generateReply(history);
+    reply = r.text || '';
+    if (callId) callSessions[callId].messages.push({ role: 'assistant', content: r.raw });
+  } catch (err) {
+    console.error('Vapi /chat/completions error:', err.message);
+    reply = "Sorry, I didn't quite catch that — could you say that again?";
+  }
+
+  const id = 'chatcmpl-' + Date.now();
+  const created = Math.floor(Date.now() / 1000);
+  const model = body.model || LLM_MODEL;
+
+  // Non-streaming fallback (Vapi normally sends stream: true).
+  if (body.stream === false) {
+    return res.json({
+      id, object: 'chat.completion', created, model,
+      choices: [{ index: 0, message: { role: 'assistant', content: reply }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+    });
+  }
+
+  // Stream the reply back as OpenAI SSE chunks.
+  res.set('Content-Type', 'text/event-stream');
+  res.set('Cache-Control', 'no-cache');
+  res.set('Connection', 'keep-alive');
+  const base = { id, object: 'chat.completion.chunk', created, model };
+  sseChunk(res, { ...base, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] });
+  sseChunk(res, { ...base, choices: [{ index: 0, delta: { content: reply }, finish_reason: null }] });
+  sseChunk(res, { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+  res.write('data: [DONE]\n\n');
+  res.end();
 });
 
 // ── TTS (text-to-speech: ElevenLabs) ──

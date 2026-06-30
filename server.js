@@ -224,7 +224,7 @@ You take orders by phone — warm, friendly, efficient, with a touch of Scottish
 - Meals: confirm whether they want the meal (with fries) or just the item on its own.
 - ETAs: delivery ~35-45 min, collection ~15-20 min.
 - Always get the customer's name for the order before finishing.
-- When the order is complete, read the items back by name (with any customisations) and give the order total using the {{TOTAL}} placeholder.
+- When the order is complete, read the items back by name (with any customisations), give the order total using the {{TOTAL}} placeholder, AND ALWAYS state the time at the end: say "that'll be 35-45 minutes" for delivery, or "about 15-20 minutes" for collection. Never close the order without giving this time.
 - End the final recap with a warm, natural sign-off — wish them well and to enjoy their food (e.g. "Enjoy your meal!", "Have a lovely evening!", "Cheers, enjoy!"). Vary it naturally, keep it short, never use the exact same line every time.
 </order_flow>
 
@@ -697,6 +697,12 @@ app.post('/chat/completions', async (req, res) => {
     console.error('Vapi /chat/completions error:', err.message);
     reply = "Sorry, I didn't quite catch that — could you say that again?";
   }
+
+  // Make prices and pizza sizes SPEAK correctly on the phone: "£11.48" -> "11
+  // pounds 48", 10" -> "10 inch". The web app does this in its /tts route; the
+  // Vapi path sends text straight to ElevenLabs, so we normalise it here. Only
+  // the spoken reply is changed — stored history (r.raw) keeps £/placeholders.
+  reply = normalizeForSpeech(reply);
 
   const id = 'chatcmpl-' + Date.now();
   const created = Math.floor(Date.now() / 1000);

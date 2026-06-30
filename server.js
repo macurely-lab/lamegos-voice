@@ -723,13 +723,12 @@ app.get('/tts', async (req, res) => {
   }
 });
 
-// Only start the HTTP server when run directly (`node server.js`); when required
-// (e.g. by tests) just export the pure helpers.
-if (require.main === module) {
-  app.listen(process.env.PORT || 3000, () => {
-    console.log('🍔 Lamego\'s AI running at http://localhost:3000');
-    fetchWeather();
-  });
-}
+// Start the HTTP server. Called unconditionally (no `require.main === module`
+// guard) because some hosts (e.g. Hostinger) load the entry file via a wrapper
+// rather than running it directly, which would skip a guarded listen().
+app.listen(process.env.PORT || 3000, () => {
+  console.log('🍔 Lamego\'s AI running at http://localhost:3000');
+  fetchWeather();
+});
 
 module.exports = { salvageParsed, extractBalancedArray, normalizeOrder, normalizeOrderItem, injectPrices, currentItemPrice, reconcileOrder, lastUserText, buildAddress, REMOVAL_INTENT };

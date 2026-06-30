@@ -867,17 +867,9 @@
       } catch (e) { ttsAudio.muted = false; }
     }
 
-    function fallbackBrowserTTS(text) {
-      window.speechSynthesis.cancel();
-      const utt = new SpeechSynthesisUtterance(text);
-      utt.lang = 'en-GB';
-      utt.rate = 1.05;
-      utt.pitch = 1.05;
-      const voices = window.speechSynthesis.getVoices();
-      const gb = voices.find(v => v.lang === 'en-GB');
-      if (gb) utt.voice = gb;
-      window.speechSynthesis.speak(utt);
-    }
+    // Browser speech-synthesis fallback removed — ElevenLabs is the ONLY voice.
+    // If ElevenLabs /tts fails, the reply is shown as text with no spoken audio
+    // (never the browser's default system voice).
 
     // speak(text, onReady) — sends the whole reply to ElevenLabs as ONE request and
     // plays it as a single clip. This is gapless (no chunk-boundary hitches or clipped
@@ -897,12 +889,12 @@
         readyFired = true;
         if (onReady) onReady();
       };
+      // ElevenLabs TTS failed — reveal the reply as text, but play no audio.
       const doFallback = () => {
         if (fellBack) return;
         fellBack = true;
         stopCurrentAudio();
         fireReady();
-        fallbackBrowserTTS(text);
       };
 
       // Reuse the single unlocked element so mobile lets it play.
@@ -916,7 +908,7 @@
       const onReadyEvt = () => fireReady();
       const onEnded = () => { if (currentAudio === audio) currentAudio = null; };
       const onError = () => {
-        console.warn('TTS audio error, falling back to browser TTS');
+        console.warn('TTS audio error (ElevenLabs) — no voice played');
         if (!readyFired) doFallback();
       };
       ttsHandlers = { ready: onReadyEvt, ended: onEnded, error: onError };
@@ -929,7 +921,7 @@
       audio.addEventListener('error', onError);
 
       audio.play().catch((err) => {
-        console.warn('Audio play failed, falling back to browser TTS:', err.message);
+        console.warn('Audio play failed (ElevenLabs):', err.message);
         doFallback();
       });
 

@@ -554,7 +554,12 @@ async function generateReply(messages) {
     model: LLM_MODEL,
     max_tokens: 600,
     // System prompt is a top-level param in the Messages API (not a message).
-    system: getSystemPrompt(),
+    // Wrapped as a content block with cache_control so Anthropic PROMPT-CACHES the
+    // large static tools+menu prefix (~3k tokens). From turn 2 of a call the model
+    // skips re-reading the menu → faster + cheaper. The cache is content-hashed, so
+    // any edit to this prompt auto-invalidates it (no manual clearing) and it
+    // auto-expires after ~5 min idle. No behaviour change — identical content.
+    system: [{ type: 'text', text: getSystemPrompt(), cache_control: { type: 'ephemeral' } }],
     tools: [RESPONSE_TOOL],
     // Force the model to answer by calling submit_response — guarantees a
     // structured, schema-valid object instead of free-form text.

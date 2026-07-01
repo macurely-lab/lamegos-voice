@@ -688,6 +688,17 @@ app.post('/chat/completions', async (req, res) => {
       .map(m => ({ role: m.role, content: contentToText(m.content) }));
   }
 
+  // Model-generated FIRST message: when the call has just connected and there is
+  // no caller utterance yet, seed a silent kickoff turn so the brain produces the
+  // greeting itself (weather line + first question). This also keeps history valid
+  // — the Anthropic Messages API requires it to start with a user turn. The caller
+  // never hears this synthetic turn; it only prompts the opening line.
+  if (!history.some(m => m.role === 'user')) {
+    const kickoff = { role: 'user', content: '(The call has just connected. Greet the customer warmly and ask your first question.)' };
+    if (callId) callSessions[callId].messages.push(kickoff);
+    else history = history.concat([kickoff]);
+  }
+
   let reply;
   try {
     const r = await generateReply(history);
@@ -752,7 +763,12 @@ function normalizeForSpeech(text) {
       if (pence === 0) return `${pounds} ${poundWord}`;
       return `${pounds} ${poundWord} ${pence}`;
     })
-    .replace(/(\d+)\s*"/g, '$1 inch'); // 10" -> 10 inch (pizza sizes)
+    .replace(/(\d+)\s*"/g, '$1 inch') // 10" -> 10 inch (pizza sizes)
+    // Number ranges: "35-45" -> "35 to 45", "15-20" -> "15 to 20". ElevenLabs
+    // otherwise misreads the hyphen (e.g. "35-45" as "three, five for five"),
+    // which mangled the delivery/collection ETA. Runs after £ conversion, so it
+    // never touches prices (those are already words by now).
+    .replace(/(\d+)\s*-\s*(\d+)/g, '$1 to $2');
 }
 
 async function fetchElevenLabsStream(text) {

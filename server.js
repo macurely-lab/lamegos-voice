@@ -41,6 +41,22 @@ if (process.env.DATABASE_URL) {
   }
 }
 
+// Current UK wall-clock time (Europe/London, auto-adjusts BST/GMT) as a MySQL
+// 'YYYY-MM-DD HH:MM:SS' string. The main market is the UK, so we store order times
+// as UK local time directly — the DB and dashboard then both read correct local
+// time with NO timezone conversion anywhere.
+function ukNow() {
+  const p = Object.fromEntries(
+    new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Europe/London', hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    }).formatToParts(new Date()).map(x => [x.type, x.value])
+  );
+  const hour = p.hour === '24' ? '00' : p.hour; // guard midnight edge case
+  return `${p.year}-${p.month}-${p.day} ${hour}:${p.minute}:${p.second}`;
+}
+
 async function initOrdersTable() {
   if (!dbPool) { console.log('ℹ️  DATABASE_URL not set — order saving disabled.'); return; }
   try {
@@ -48,7 +64,7 @@ async function initOrdersTable() {
       `CREATE TABLE IF NOT EXISTS orders (
         id INT AUTO_INCREMENT PRIMARY KEY,
         call_id VARCHAR(128) UNIQUE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at DATETIME,
         branch VARCHAR(32),
         order_type VARCHAR(16),
         customer_name VARCHAR(128),
@@ -74,14 +90,14 @@ async function saveOrder(callId, snap, phone) {
   try {
     await dbPool.query(
       `INSERT INTO orders
-         (call_id, branch, order_type, customer_name, phone, address, postcode, street, house_number, items, total)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)
+         (call_id, created_at, branch, order_type, customer_name, phone, address, postcode, street, house_number, items, total)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
        ON DUPLICATE KEY UPDATE
          branch=VALUES(branch), order_type=VALUES(order_type), customer_name=VALUES(customer_name),
          phone=VALUES(phone), address=VALUES(address), postcode=VALUES(postcode),
          street=VALUES(street), house_number=VALUES(house_number),
          items=VALUES(items), total=VALUES(total)`,
-      [callId, snap.branch, snap.orderType, snap.customerName, phone, snap.address,
+      [callId, ukNow(), snap.branch, snap.orderType, snap.customerName, phone, snap.address,
        snap.postcode, snap.street, snap.houseNumber, JSON.stringify(snap.items), snap.total]
     );
     console.log(`✅ order saved (call ${callId}): ${snap.items.length} item(s), £${Number(snap.total || 0).toFixed(2)}`);

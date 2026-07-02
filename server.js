@@ -9,7 +9,7 @@ const fs = require('fs');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' })); // large enough for Vapi's end-of-call-report
 app.use(express.static(path.join(__dirname, 'public')));
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -27,6 +27,68 @@ const STT_PROMPT =
   "Fried Chicken, Loaded Fries, Rice Box, Irn Bru, Pepsi Max, Rubicon Mango, Tango Orange, " +
   "Biscoff, Lotus, Ferrero Rocher, Kinder Bueno, Maltesers, mozzarella sticks, jalapeno poppers, " +
   "onion rings, milkshake, mini cheesecake, Wishaw, Blantyre, delivery, collection.";
+
+// ── ORDERS DATABASE (MySQL) ────────────────────────────────────
+// Persists finished orders so the SEPARATE dashboard app can read them. The brain
+// only WRITES here. If DATABASE_URL is unset or the DB is unreachable, saving is
+// skipped and the phone line keeps working — a DB problem never breaks a call.
+let dbPool = null;
+if (process.env.DATABASE_URL) {
+  try {
+    dbPool = require('mysql2/promise').createPool(process.env.DATABASE_URL);
+  } catch (e) {
+    console.error('DB disabled (order saving off):', e.message);
+  }
+}
+
+async function initOrdersTable() {
+  if (!dbPool) { console.log('ℹ️  DATABASE_URL not set — order saving disabled.'); return; }
+  try {
+    await dbPool.query(
+      `CREATE TABLE IF NOT EXISTS orders (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        call_id VARCHAR(128) UNIQUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        branch VARCHAR(32),
+        order_type VARCHAR(16),
+        customer_name VARCHAR(128),
+        phone VARCHAR(32),
+        address VARCHAR(255),
+        postcode VARCHAR(16),
+        street VARCHAR(128),
+        house_number VARCHAR(32),
+        items JSON,
+        total DECIMAL(10,2)
+      )`
+    );
+    console.log('✅ orders table ready');
+  } catch (e) {
+    console.error('Could not create orders table:', e.message);
+  }
+}
+
+// Save one finished order, deduped by call_id (Vapi may resend the report).
+// Skips silently if there's no DB or the call had no items.
+async function saveOrder(callId, snap, phone) {
+  if (!dbPool || !callId || !snap || !Array.isArray(snap.items) || snap.items.length === 0) return;
+  try {
+    await dbPool.query(
+      `INSERT INTO orders
+         (call_id, branch, order_type, customer_name, phone, address, postcode, street, house_number, items, total)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)
+       ON DUPLICATE KEY UPDATE
+         branch=VALUES(branch), order_type=VALUES(order_type), customer_name=VALUES(customer_name),
+         phone=VALUES(phone), address=VALUES(address), postcode=VALUES(postcode),
+         street=VALUES(street), house_number=VALUES(house_number),
+         items=VALUES(items), total=VALUES(total)`,
+      [callId, snap.branch, snap.orderType, snap.customerName, phone, snap.address,
+       snap.postcode, snap.street, snap.houseNumber, JSON.stringify(snap.items), snap.total]
+    );
+    console.log(`✅ order saved (call ${callId}): ${snap.items.length} item(s), £${Number(snap.total || 0).toFixed(2)}`);
+  } catch (e) {
+    console.error('Failed to save order:', e.message);
+  }
+}
 
 // ── SESSION MEMORY ─────────────────────────────────────────────
 const sessions = {};
@@ -708,7 +770,17 @@ app.post('/chat/completions', async (req, res) => {
   try {
     const r = await generateReply(history);
     reply = r.text || '';
-    if (callId) callSessions[callId].messages.push({ role: 'assistant', content: r.raw });
+    if (callId) {
+      callSessions[callId].messages.push({ role: 'assistant', content: r.raw });
+      // Stash the latest order snapshot so the end-of-call webhook can persist it.
+      callSessions[callId].order = {
+        items: r.order,
+        total: r.order.reduce((s, it) => s + it.price, 0),
+        branch: r.branch, orderType: r.orderType, address: r.address,
+        postcode: r.postcode, street: r.street, houseNumber: r.houseNumber,
+        customerName: r.customerName
+      };
+    }
   } catch (err) {
     console.error('Vapi /chat/completions error:', err.message);
     reply = "Sorry, I didn't quite catch that — could you say that again?";
@@ -743,6 +815,30 @@ app.post('/chat/completions', async (req, res) => {
   sseChunk(res, { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
   res.write('data: [DONE]\n\n');
   res.end();
+});
+
+// ── VAPI SERVER WEBHOOK (order capture) ────────────────────────
+// Vapi POSTs call events here (set this as the assistant's Server URL). On the
+// end-of-call-report we persist that call's finished order to MySQL. Every other
+// event type is just acknowledged. Always replies 200 fast so Vapi doesn't retry.
+app.post('/vapi/server', async (req, res) => {
+  try {
+    const msg = (req.body && req.body.message) || {};
+    if (msg.type === 'end-of-call-report') {
+      const call = msg.call || {};
+      const callId = call.id || null;
+      const phone = (call.customer && call.customer.number)
+        || (msg.customer && msg.customer.number)
+        || (msg.phoneNumber && msg.phoneNumber.number) || null;
+      const snap = (callId && callSessions[callId]) ? callSessions[callId].order : null;
+      if (process.env.CAPTURE_DEBUG) console.error('[capture]', callId, JSON.stringify(snap));
+      await saveOrder(callId, snap, phone);
+      if (callId) delete callSessions[callId]; // free memory once the call is done
+    }
+  } catch (e) {
+    console.error('Vapi webhook error:', e.message);
+  }
+  res.status(200).json({ received: true });
 });
 
 // ── TTS (text-to-speech: ElevenLabs) ──
@@ -887,6 +983,7 @@ if (require.main === module) {
   app.listen(process.env.PORT || 3000, () => {
     console.log('🍔 Lamego\'s AI running at http://localhost:3000');
     fetchWeather();
+    initOrdersTable();
   });
 }
 
